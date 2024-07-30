@@ -1,0 +1,243 @@
+---
+output: 
+  pdf_document: 
+    keep_tex: true
+---
+```{r}
+library(tidycensus) #Retrieve ACS data
+library(tidyverse)
+library(sf) #Spatial dataframes
+library(dplyr)
+library(tictoc)
+library(raster) #Raster manipulation
+library(data.table)
+library(ggplot2)
+library(stringr)
+```
+```{r}
+clinics <- read.csv("urgentcare_nodes.csv")
+filtered_origins <- read.csv("filtered_origins.csv")
+travel_time_car <- read.csv("travel_time_car.csv")
+travel_time_walk <- read.csv("travel_time_walk.csv")
+travel_time_transit <- read.csv("travel_time_transit.csv")
+```
+
+```{r}
+#census_api_key("6022f8f359953c980037f73fe612fb240b1ef2b8", install = TRUE)
+readRenviron("~/.Renviron")
+
+hennepin_block_groups <- get_acs(geography = "block group", 
+                                 variables = c("B19013_001"), 
+                                 state = "MN", 
+                                 county = "Hennepin",
+                                 year = 2022, 
+                                 geometry = TRUE)
+
+ramsey_block_groups <- get_acs(geography = "block group", 
+                               variables = c("B19013_001"), 
+                               state = "MN", 
+                               county = "Ramsey",
+                               year = 2022, 
+                               geometry = TRUE)
+
+block_groups <- bind_rows(hennepin_block_groups, ramsey_block_groups)
+
+# find geometry of twin cities, then use intersection to elim region outside twin cities
+minneapolis_geom <- places("MN", cb = TRUE) %>%
+  filter(NAME == "Minneapolis") %>%
+  st_geometry()
+
+stpaul_geom <- places("MN", cb = TRUE) %>%
+  filter(NAME == "St. Paul") %>%
+  st_geometry()
+
+block_groups <- st_as_sf(block_groups)
+minneapolis_block_groups <- st_intersection(block_groups, minneapolis_geom)
+stpaul_block_groups <- st_intersection(block_groups, stpaul_geom)
+minneapolis_stpaul_block_groups <- bind_rows(minneapolis_block_groups, stpaul_block_groups)
+
+```
+```{r}
+# calculate lowest and highest income block groups
+minneapolis_stpaul_block_groups <- na.omit(minneapolis_stpaul_block_groups)
+P20 <- quantile(minneapolis_stpaul_block_groups$estimate, 0.20)
+P80 <- quantile(minneapolis_stpaul_block_groups$estimate, 0.80)
+blockgroup20 <- minneapolis_stpaul_block_groups[minneapolis_stpaul_block_groups$estimate <= P20,]
+blockgroup80 <- minneapolis_stpaul_block_groups[minneapolis_stpaul_block_groups$estimate > P80,]
+# from us census: centers of population of block group are the origins
+# acs data need to be preprocessed to match centers of pop
+a <- str_extract_all(blockgroup20$NAME, "\\d+\\.?\\d*") 
+number_cols <- t(as.data.frame(a))
+colnames(number_cols) <- c("BLKGRPCE", "TRACTCE") 
+blockgroup20 <- cbind(blockgroup20, number_cols)
+blockgroup20$TRACTCE <- as.numeric(blockgroup20$TRACTCE)
+blockgroup20$BLKGRPCE <- as.numeric(blockgroup20$BLKGRPCE)
+blockgroup20$TRACTCE <- blockgroup20$TRACTCE * 100 
+
+b <- str_extract_all(blockgroup80$NAME, "\\d+\\.?\\d*")
+number_cols <- t(as.data.frame(b))
+colnames(number_cols) <- c("BLKGRPCE", "TRACTCE") 
+blockgroup80 <- cbind(blockgroup80, number_cols)
+blockgroup80$TRACTCE <- as.numeric(blockgroup80$TRACTCE)
+blockgroup80$BLKGRPCE <- as.numeric(blockgroup80$BLKGRPCE)
+blockgroup80$TRACTCE <- blockgroup80$TRACTCE * 100 
+
+names(blockgroup20)[names(blockgroup20) == 'estimate'] <- 'income'
+names(blockgroup80)[names(blockgroup80) == 'estimate'] <- 'income'
+```
+```{r}
+# data conversion and trip selection
+bg20_car <- travel_time_car %>%
+  inner_join(blockgroup20, by = c("TRACTCE", "BLKGRPCE"))
+bg20_transit <- travel_time_transit %>%
+  inner_join(blockgroup20, by = c("TRACTCE", "BLKGRPCE"))
+bg20_walk <- travel_time_walk %>%
+  inner_join(blockgroup20, by = c("TRACTCE", "BLKGRPCE"))
+bg80_car <- travel_time_car %>%
+  inner_join(blockgroup80, by = c("TRACTCE", "BLKGRPCE"))
+bg80_transit <- travel_time_transit %>%
+  inner_join(blockgroup80, by = c("TRACTCE", "BLKGRPCE"))
+bg80_walk <- travel_time_walk %>%
+  inner_join(blockgroup80, by = c("TRACTCE", "BLKGRPCE"))
+```
+```{r}
+# B25044, Tenure by Vehicles Available
+vehicle_total <- get_acs(geography = "block group",
+                                 variables = "B25044_001",
+                                 state = "MN", 
+                                 county = c("Hennepin", "Ramsey"),
+                                 year = 2022)
+vehicle_none <- get_acs(geography = "block group",
+                                 variables = "B25044_002",
+                                 state = "MN", 
+                                 county = c("Hennepin", "Ramsey"),
+                                 year = 2022)
+vehicle_combined <- left_join(vehicle_total, vehicle_none, by = "GEOID")
+vehicle_combined <- vehicle_combined %>%
+  mutate(
+    pct_households_without_vehicle = estimate.y / estimate.x * 100
+  )
+
+vehicle_bg20 <- vehicle_combined %>%
+  inner_join(blockgroup20, by = "GEOID")
+vehicle_bg80 <- vehicle_combined %>%
+  inner_join(blockgroup80, by = "GEOID")
+
+
+```
+```{r}
+# B02001, Race
+race_total <- get_acs(geography = "block group",
+                                 variables = "B02001_001",
+                                 state = "MN", 
+                                 county = c("Hennepin", "Ramsey"),
+                                 year = 2022)
+race_white <- get_acs(geography = "block group",
+                                 variables = "B02001_002",
+                                 state = "MN", 
+                                 county = c("Hennepin", "Ramsey"),
+                                 year = 2022)
+race_nonwhite <- left_join(race_total, race_white, by = "GEOID")
+race_nonwhite <- race_nonwhite %>%
+  mutate(
+    pct_nonwhite = (1 - estimate.y / estimate.x) * 100
+  )
+
+race_bg20 <- race_nonwhite %>%
+  inner_join(blockgroup20, by = "GEOID")
+race_bg80 <- race_nonwhite %>%
+  inner_join(blockgroup80, by = "GEOID")
+
+P20 <- quantile(race_bg20$pct_nonwhite, 0.20)
+P80 <- quantile(race_bg20$pct_nonwhite, 0.80)
+race_bg20_high_minority <- race_bg20[race_bg20$pct_nonwhite <= P20,]
+race_bg20_low_minority <- race_bg20[race_bg20$pct_nonwhite > P80,]
+
+# using the GEOIDs from race_bg20_high_minority, race_bg20_low_minority
+# select the travel_time from bg20_car/transit/walk
+
+```
+```{r}
+bg20_car_high_minority <- travel_time_car %>%
+  inner_join(race_bg20_high_minority, by = c("TRACTCE", "BLKGRPCE"))
+bg20_transit_high_minority <- travel_time_transit %>%
+  inner_join(race_bg20_high_minority, by = c("TRACTCE", "BLKGRPCE"))
+bg20_walk_high_minority <- travel_time_walk %>%
+  inner_join(race_bg20_high_minority, by = c("TRACTCE", "BLKGRPCE"))
+
+bg20_car_low_minority <- travel_time_car %>%
+  inner_join(race_bg20_low_minority, by = c("TRACTCE", "BLKGRPCE"))
+bg20_transit_low_minority <- travel_time_transit %>%
+  inner_join(race_bg20_low_minority, by = c("TRACTCE", "BLKGRPCE"))
+bg20_walk_low_minority <- travel_time_walk %>%
+  inner_join(race_bg20_low_minority, by = c("TRACTCE", "BLKGRPCE"))
+```
+
+```{r}
+res <- vehicle_bg20 %>%
+  inner_join(race_bg20_low_minority, by="GEOID")
+mean(res$pct_households_with_vehicle)
+```
+
+```{r}
+res <- bg20_car_high_minority %>%
+  group_by(GEOID) %>%
+  summarize(min_travel_times = min(travel_time))
+write.csv(res, "bg20_car_high_minority.csv")
+mean(res$min_travel_times)
+res <- bg20_transit_high_minority %>%
+  group_by(GEOID) %>%
+  summarize(min_travel_times = min(travel_time))
+write.csv(res, "bg20_transit_high_minority.csv")
+mean(res$min_travel_times)
+res <- bg20_walk_high_minority %>%
+  group_by(GEOID) %>%
+  summarize(min_travel_times = min(travel_time))
+mean(res$min_travel_times)
+
+res <- bg20_car_low_minority %>%
+  group_by(GEOID) %>%
+  summarize(min_travel_times = min(travel_time))
+write.csv(res, "bg20_car_low_minority.csv")
+mean(res$min_travel_times)
+res <- bg20_transit_low_minority %>%
+  group_by(GEOID) %>%
+  summarize(min_travel_times = min(travel_time))
+write.csv(res, "bg20_transit_low_minority.csv")
+mean(res$min_travel_times)
+res <- bg20_walk_low_minority %>%
+  group_by(GEOID) %>%
+  summarize(min_travel_times = min(travel_time))
+mean(res$min_travel_times)
+
+res <- bg20_car %>%
+  group_by(GEOID) %>%
+  summarize(min_travel_times = min(travel_time))
+write.csv(res, "bg20_car.csv")
+mean(res$min_travel_times)
+res <- bg20_transit %>%
+  group_by(GEOID) %>%
+  summarize(min_travel_times = min(travel_time))
+write.csv(res, "bg20_transit.csv")
+mean(res$min_travel_times)
+res <- bg20_walk %>%
+  group_by(GEOID) %>%
+  summarize(min_travel_times = min(travel_time))
+mean(res$min_travel_times)
+
+res <- bg80_car %>%
+  group_by(GEOID) %>%
+  summarize(min_travel_times = min(travel_time))
+write.csv(res, "bg80_car.csv")
+mean(res$min_travel_times)
+res <- bg80_transit %>%
+  group_by(GEOID) %>%
+  summarize(min_travel_times = min(travel_time))
+write.csv(res, "bg80_transit.csv")
+mean(res$min_travel_times)
+res <- bg80_walk %>%
+  group_by(GEOID) %>%
+  summarize(min_travel_times = min(travel_time))
+mean(res$min_travel_times)
+```
+
